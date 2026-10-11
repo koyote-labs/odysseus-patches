@@ -1,0 +1,79 @@
+# Carry the signed-in person onto model calls to the permission layer
+#
+# Adds: model calls to the Home Base permission layer carry X-Home-Base-User
+# and X-Home-Base-Caller-Secret, so the permission layer applies that
+# person's rules.
+# Why: Odysseus makes model calls deep in src/llm_core.py, with no access to
+# who asked. Every call site passes its headers through with_identity, which
+# adds the identity only when the request came through the edge, the target
+# host is HOME_BASE_PERMISSION_LAYER_HOST, and HOME_BASE_CALLER_SECRET is set.
+# No other endpoint is ever told who is asking.
+# Upstream: a Home Base feature, not a bug fix. Needs 0005.
+# Test: tests/test_home_base_identity.py (in 0005)
+
+diff --git a/src/llm_core.py b/src/llm_core.py
+index cea829d4..4ebfed2f 100644
+--- a/src/llm_core.py
++++ b/src/llm_core.py
+@@ -1,5 +1,7 @@
+ # src/llm_core.py
+ import httpx
++
++from src.home_base_identity import with_identity
+ import asyncio
+ import copy
+ import time
+@@ -934,7 +936,7 @@ def httpx_get_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
+ def httpx_post_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
+     h = apply_kimi_code_headers(headers, url)
+     if not _is_kimi_code_url(url):
+-        return httpx.post(url, headers=h, **kwargs)
++        return httpx.post(url, headers=with_identity(url, h), **kwargs)
+     last = None
+     for ua in _kimi_code_ua_candidates(url):
+         trial = dict(h)
+@@ -950,7 +952,7 @@ def httpx_post_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
+ async def httpx_post_kimi_aware_async(client, url: str, headers: Optional[Dict], **kwargs):
+     h = await apply_kimi_code_headers_async(client, headers, url)
+     if not _is_kimi_code_url(url):
+-        return await client.post(url, headers=h, **kwargs)
++        return await client.post(url, headers=with_identity(url, h), **kwargs)
+     last = None
+     for ua in _kimi_code_ua_candidates(url):
+         trial = dict(h)
+@@ -2686,7 +2688,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
+         _responses_model_announced = False
+         try:
+             client = _get_http_client()
+-            async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
++            async with client.stream('POST', target_url, json=payload, headers=with_identity(target_url, h), timeout=stream_timeout) as r:
+                 _clear_host_dead(target_url)
+                 if r.status_code != 200:
+                     raw = (await r.aread()).decode(errors="replace")
+@@ -2807,7 +2809,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
+         _ollama_model_announced = False
+         try:
+             client = _get_http_client()
+-            async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
++            async with client.stream('POST', target_url, json=payload, headers=with_identity(target_url, h), timeout=stream_timeout) as r:
+                 _clear_host_dead(target_url)
+                 if r.status_code != 200:
+                     raw = (await r.aread()).decode(errors="replace")
+@@ -2906,7 +2908,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
+         _anth_block_type = ""
+         try:
+             client = _get_http_client()
+-            async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
++            async with client.stream('POST', target_url, json=payload, headers=with_identity(target_url, h), timeout=stream_timeout) as r:
+                 _clear_host_dead(target_url)
+                 if r.status_code != 200:
+                     raw = (await r.aread()).decode(errors="replace")
+@@ -3087,7 +3089,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
+     try:
+         client = _get_http_client()
+         h = await apply_kimi_code_headers_async(client, h, target_url)
+-        async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
++        async with client.stream('POST', target_url, json=payload, headers=with_identity(target_url, h), timeout=stream_timeout) as r:
+             _clear_host_dead(target_url)
+             if r.status_code != 200:
+                 raw = (await r.aread()).decode(errors="replace")

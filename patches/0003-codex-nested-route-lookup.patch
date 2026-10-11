@@ -1,0 +1,137 @@
+# Find app routes inside nested routers on current FastAPI
+#
+# Fixes: the Codex cookbook bridge endpoints (/cookbook/serve,
+# /cookbook/cached, /cookbook/preset/{name}) return 503 because they cannot
+# find /api/model/serve and /api/model/cached on the app.
+# Why: FastAPI 0.14x keeps each included router as a nested wrapper instead of
+# flattening its routes into app.routes, and upstream does not pin FastAPI.
+# The lookup now descends into included routers and joins their prefixes.
+# Verified live: the image built from upstream gets FastAPI 0.141.1, and the
+# old lookup finds nothing there.
+# Upstream: not fixed on main or dev at 3b6c1691. Being prepared as an
+# upstream pull request.
+# Test: tests/test_codex_find_app_endpoint.py (new file)
+
+diff --git a/routes/codex_routes.py b/routes/codex_routes.py
+index 9fe36a82..db42de48 100644
+--- a/routes/codex_routes.py
++++ b/routes/codex_routes.py
+@@ -133,6 +133,31 @@ def _find_endpoint(router: APIRouter | None, method: str, path: str):
+     return None
+ 
+ 
++def _find_app_endpoint(routes, method: str, path: str, prefix: str = ""):
++    """Find a route endpoint on the app by method + full path.
++
++    FastAPI >= 0.14x no longer flattens ``include_router`` into ``app.routes``;
++    it keeps an ``_IncludedRouter`` wrapper per router, so descend into its
++    ``original_router`` (joining any include prefix). Older FastAPI versions
++    expose flat ``APIRoute`` entries and match on the first loop.
++    """
++    for route in routes or []:
++        if prefix + (getattr(route, "path", None) or "") == path and method in (getattr(route, "methods", None) or set()):
++            return route.endpoint
++        inner = getattr(route, "original_router", None)
++        if inner is not None:
++            ctx = getattr(route, "include_context", None)
++            found = _find_app_endpoint(
++                getattr(inner, "routes", []),
++                method,
++                path,
++                prefix + (getattr(ctx, "prefix", "") or ""),
++            )
++            if found is not None:
++                return found
++    return None
++
++
+ def _clamp_pagination(offset: Any, limit: Any, *, default_limit: int = 50, max_limit: int = 50) -> tuple[int, int]:
+     try:
+         parsed_offset = int(0 if offset in (None, "") else offset)
+@@ -662,12 +687,7 @@ def setup_codex_routes(
+         serve_endpoint = _find_endpoint(None, "POST", "/api/model/serve")
+         # Fall back to importing from the cookbook router registered on app.
+         if serve_endpoint is None:
+-            from fastapi import FastAPI
+-            app: FastAPI = request.app
+-            for route in app.routes:
+-                if getattr(route, "path", None) == "/api/model/serve" and "POST" in getattr(route, "methods", set()):
+-                    serve_endpoint = route.endpoint
+-                    break
++            serve_endpoint = _find_app_endpoint(request.app.routes, "POST", "/api/model/serve")
+         if serve_endpoint is None:
+             raise HTTPException(503, "model serve endpoint unavailable")
+         return await serve_endpoint(request, req)
+@@ -734,12 +754,7 @@ def setup_codex_routes(
+             params["platform"] = srv["platform"]
+         cached_endpoint = _find_endpoint(None, "GET", "/api/model/cached")
+         if cached_endpoint is None:
+-            from fastapi import FastAPI
+-            app: FastAPI = request.app
+-            for route in app.routes:
+-                if getattr(route, "path", None) == "/api/model/cached" and "GET" in getattr(route, "methods", set()):
+-                    cached_endpoint = route.endpoint
+-                    break
++            cached_endpoint = _find_app_endpoint(request.app.routes, "GET", "/api/model/cached")
+         if cached_endpoint is None:
+             raise HTTPException(503, "model cached endpoint unavailable")
+         # The endpoint reads host/model_dir/ssh_port/platform as kwargs.
+@@ -812,12 +827,7 @@ def setup_codex_routes(
+             raise HTTPException(400, f"Preset payload invalid: {exc}")
+         serve_endpoint = _find_endpoint(None, "POST", "/api/model/serve")
+         if serve_endpoint is None:
+-            from fastapi import FastAPI
+-            app: FastAPI = request.app
+-            for route in app.routes:
+-                if getattr(route, "path", None) == "/api/model/serve" and "POST" in getattr(route, "methods", set()):
+-                    serve_endpoint = route.endpoint
+-                    break
++            serve_endpoint = _find_app_endpoint(request.app.routes, "POST", "/api/model/serve")
+         if serve_endpoint is None:
+             raise HTTPException(503, "model serve endpoint unavailable")
+         return await serve_endpoint(request, req)
+diff --git a/tests/test_codex_find_app_endpoint.py b/tests/test_codex_find_app_endpoint.py
+new file mode 100644
+index 00000000..aaf0fd1f
+--- /dev/null
++++ b/tests/test_codex_find_app_endpoint.py
+@@ -0,0 +1,39 @@
++"""Codex cookbook bridges look up sibling routes (/api/model/serve, /api/model/cached)
++on the running app. FastAPI >= 0.14x keeps included routers nested instead of
++flattening them into ``app.routes``, so the lookup must descend into them."""
++
++from fastapi import APIRouter, FastAPI
++
++from routes.codex_routes import _find_app_endpoint
++
++
++def test_finds_route_in_included_router_with_prefix():
++    router = APIRouter()
++
++    @router.get("/model/cached")
++    async def model_cached():
++        return {}
++
++    @router.post("/model/serve")
++    async def model_serve():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router, prefix="/api")
++
++    assert _find_app_endpoint(app.routes, "GET", "/api/model/cached") is model_cached
++    assert _find_app_endpoint(app.routes, "POST", "/api/model/serve") is model_serve
++
++
++def test_method_and_path_must_both_match():
++    router = APIRouter()
++
++    @router.get("/api/model/cached")
++    async def model_cached():
++        return {}
++
++    app = FastAPI()
++    app.include_router(router)
++
++    assert _find_app_endpoint(app.routes, "POST", "/api/model/cached") is None
++    assert _find_app_endpoint(app.routes, "GET", "/model/cached") is None

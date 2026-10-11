@@ -1,0 +1,67 @@
+# Honour the inpaint mask and editor settings on image edits
+#
+# Fixes: a masked edit from the gallery editor either fails or repaints the
+# whole image, and the editor's strength and feather settings are dropped.
+# Why: the gallery sent /images/edits without strength and feather, and the
+# diffusion server ignored the mask and called the pipeline without
+# mask_image. A request with a mask now goes to the existing inpaint handler.
+# Upstream: not fixed on main or dev at 3b6c1691.
+# Test: none upstream. Needs a diffusion model to exercise.
+
+diff --git a/routes/gallery/gallery_routes.py b/routes/gallery/gallery_routes.py
+index e6b5e071..2d7e348f 100644
+--- a/routes/gallery/gallery_routes.py
++++ b/routes/gallery/gallery_routes.py
+@@ -1453,6 +1453,11 @@ def setup_gallery_routes() -> APIRouter:
+                         "size": f"{int(body.get('width') or source_png.width)}x{int(body.get('height') or source_png.height)}",
+                         "n": "1",
+                     }
++                    # Editor inpaint knobs (strength slider, remove's 0.99,
++                    # feather). Servers that don't know them ignore them.
++                    for key in ("strength", "feather"):
++                        if body.get(key) is not None:
++                            data[key] = str(body[key])
+                     r = await client.post(_join_checked_gallery_endpoint(base, "/images/edits"), data=data, files=files)
+                     if r.status_code == 200:
+                         result = r.json()
+diff --git a/scripts/diffusion_server.py b/scripts/diffusion_server.py
+index f80f08f7..0a5fb8d0 100644
+--- a/scripts/diffusion_server.py
++++ b/scripts/diffusion_server.py
+@@ -763,15 +763,36 @@ def image_progress(request_id: str):
+ async def edit_image(
+     prompt: str = Form(...),
+     image: UploadFile = File(...),
++    mask: UploadFile | None = File(None),
+     model: str = Form(""),
+     n: int = Form(1),
+     size: str = Form("1024x1024"),
+     quality: str = Form("medium"),
+     response_format: str = Form("b64_json"),
+     request_id: str = Form(""),
++    strength: float = Form(0.75),
++    feather: int = Form(8),
+ ):
+     if _pipe is None:
+         return {"error": "Model not loaded"}
++    if mask is not None:
++        # A masked edit is an inpaint. Route it through the inpaint handler so
++        # the mask is honoured (native inpaint, or crop+composite fallbacks)
++        # instead of calling the pipeline without mask_image, which inpaint
++        # pipelines reject and other pipelines would apply to the whole image.
++        width, height = _parse_size(size)
++        result = inpaint_image(InpaintRequest(
++            image=base64.b64encode(await image.read()).decode(),
++            mask=base64.b64encode(await mask.read()).decode(),
++            prompt=prompt,
++            width=max(0, width),
++            height=max(0, height),
++            strength=strength,
++            feather=feather,
++        ))
++        if not result.get("image"):
++            raise HTTPException(status_code=500, detail=result.get("error") or "Inpaint failed")
++        return {"created": int(time.time()), "data": [{"b64_json": result["image"]}]}
+     accepts_image = _pipeline_accepts_arg("image")
+     accepts_input_images = _pipeline_accepts_arg("input_images")
+     if not accepts_image and not accepts_input_images:

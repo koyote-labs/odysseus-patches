@@ -1,0 +1,14 @@
+Home Base runs a modified version of Odysseus.
+
+Odysseus is copyright its authors and licensed under the GNU Affero General
+Public License, version 3 or later. Home Base is not affiliated with the
+Odysseus project.
+
+The complete source of the modified version running in your household is:
+
+  upstream   https://github.com/odysseus-dev/odysseus.git
+  commit     3b6c169162330cd35c4ce6d14949ef15fd3208a2
+  patches    https://github.com/koyote-labs/odysseus-patches
+
+Apply the patches in order to that commit and you have exactly what runs
+here. See the README in the patches repository for the commands.

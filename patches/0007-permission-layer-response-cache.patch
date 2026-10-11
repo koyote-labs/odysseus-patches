@@ -1,0 +1,210 @@
+# Every Home Base model call gets a fresh decision and audit record
+#
+# Fixes: Odysseus could return an in-memory response before the permission
+# layer saw the request. The cache key used configured endpoint headers;
+# Home Base's per-request user identity was added only at HTTP send time.
+# Why: partitioning by user would still skip policy changes and receipts
+# for repeated requests by the same person. Disable both reads and writes
+# whenever HOME_BASE_PERMISSION_LAYER_HOST is present, including anonymous
+# calls, aliases, IP addresses, and incomplete configuration. Home Base
+# routes all model requests through its broker. Without that variable,
+# upstream cache behavior stays unchanged. No new setting is needed.
+# Upstream: a Home Base integration feature. Depends on 0005 and 0006.
+# Test: tests/test_home_base_response_cache.py
+
+diff --git a/src/llm_core.py b/src/llm_core.py
+--- a/src/llm_core.py
++++ b/src/llm_core.py
+@@ -196,8 +196,14 @@
+ 
+ 
+ def _get_cache_key(url: str, model: str, messages: List[Dict],
+-                   temperature: float, max_tokens: int, headers=None) -> str:
++                   temperature: float, max_tokens: int, headers=None) -> Optional[str]:
+     """Generate a cache key partitioned by endpoint and credential identity."""
++    if "HOME_BASE_PERMISSION_LAYER_HOST" in os.environ:
++        # Home Base must evaluate identity and policy, and record every call.
++        # A cached reply would skip that even for a repeat by the same person.
++        # Disable the cache for all routes in this integration mode, including
++        # aliases and incomplete configuration, so matching a host cannot bypass it.
++        return None
+     hashable_messages = []
+     for msg in messages:
+         sorted_items = tuple(sorted(msg.items()))
+@@ -519,24 +525,30 @@
+         )
+     return _http_client
+ 
+-def _get_cached_response(cache_key: str) -> Optional[str]:
++def _get_cached_response(cache_key: Optional[str]) -> Optional[str]:
+     """Get cached response if it exists."""
++    if cache_key is None:
++        return None
+     return _response_cache.get(cache_key)
+ 
+ 
+-def _get_cached_response_model(cache_key: str) -> Optional[str]:
++def _get_cached_response_model(cache_key: Optional[str]) -> Optional[str]:
+     """Return provider-reported model metadata paired with a cached reply."""
++    if cache_key is None:
++        return None
+     model = _response_model_cache.get(cache_key)
+     return model if isinstance(model, str) and model.strip() else None
+ 
+ 
+ def _set_cached_response(
+-    cache_key: str,
++    cache_key: Optional[str],
+     response: str,
+     *,
+     actual_model: Optional[str] = None,
+ ) -> None:
+     """Store response in cache."""
++    if cache_key is None:
++        return
+     if len(_response_cache) > 128:
+         keys_to_remove = list(_response_cache.keys())[:64]
+         for key in keys_to_remove:
+diff --git a/tests/test_home_base_response_cache.py b/tests/test_home_base_response_cache.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_home_base_response_cache.py
+@@ -0,0 +1,138 @@
++"""Every Home Base model call must reach the permission layer again."""
++
++import asyncio
++
++import httpx
++import pytest
++from fastapi import HTTPException
++
++from src import home_base_identity as identity
++from src import llm_core as llm
++
++
++PERMISSION_URL = "http://permission-layer:8000/v1/chat/completions"
++MESSAGES = [{"role": "user", "content": "Suggest a dinner menu"}]
++
++
++@pytest.fixture
++def endpoint(monkeypatch):
++    monkeypatch.setenv("HOME_BASE_PERMISSION_LAYER_HOST", "permission-layer")
++    monkeypatch.setenv("HOME_BASE_CALLER_SECRET", "synthetic-caller-secret")
++    monkeypatch.setenv("ODYSSEUS_LOCAL_MODEL_GATE", "false")
++    monkeypatch.setattr(llm, "note_model_activity", lambda *args, **kwargs: None)
++    monkeypatch.setattr(llm, "_apply_local_generation_stability", lambda *args: None)
++    monkeypatch.setattr(llm, "_response_cache", {})
++    monkeypatch.setattr(llm, "_response_model_cache", {})
++    calls = []
++    statuses = []
++
++    def post(url, **kwargs):
++        calls.append(kwargs.get("headers") or {})
++        status = statuses.pop(0) if statuses else 200
++        return httpx.Response(status, json={
++            "model": "synthetic-model",
++            "choices": [{"message": {"content": f"fresh reply {len(calls)}"}}],
++        })
++
++    class Client:
++        async def post(self, url, **kwargs):
++            return post(url, **kwargs)
++
++    monkeypatch.setattr(llm.httpx, "post", post)
++    monkeypatch.setattr(llm, "_get_http_client", lambda: Client())
++    return calls, statuses
++
++
++def call(mode, user, url=PERMISSION_URL):
++    token = identity.set_user(user)
++    try:
++        if mode == "sync":
++            return llm.llm_call(url, "home-base", MESSAGES)
++        return asyncio.run(llm.llm_call_async(url, "home-base", MESSAGES, max_retries=1,
++                                             return_model_metadata=True))[0]
++    finally:
++        identity.reset_user(token)
++
++
++@pytest.mark.parametrize("mode", ["sync", "async"])
++def test_cross_person_and_repeated_requests_get_fresh_decisions(endpoint, mode):
++    calls, _ = endpoint
++    assert call(mode, "alex") == "fresh reply 1"
++    assert call(mode, "sam") == "fresh reply 2"
++    assert call(mode, "sam") == "fresh reply 3"
++    assert [headers.get("X-Home-Base-User") for headers in calls] == ["alex", "sam", "sam"]
++    assert llm._response_cache == {} and llm._response_model_cache == {}
++
++
++@pytest.mark.parametrize("mode", ["sync", "async"])
++def test_same_person_does_not_bypass_a_new_policy_denial(endpoint, mode):
++    calls, statuses = endpoint
++    statuses.extend([200, 403])
++    assert call(mode, "alex") == "fresh reply 1"
++    with pytest.raises(HTTPException):
++        call(mode, "alex")
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize("mode", ["sync", "async"])
++def test_calls_without_identity_still_reach_the_permission_layer(endpoint, mode):
++    calls, _ = endpoint
++    assert call(mode, None) == "fresh reply 1"
++    assert call(mode, None) == "fresh reply 2"
++    assert all("X-Home-Base-User" not in headers for headers in calls)
++
++
++@pytest.mark.parametrize("mode", ["sync", "async"])
++def test_unconfigured_integration_keeps_upstream_cache_behavior(endpoint, monkeypatch, mode):
++    calls, _ = endpoint
++    monkeypatch.delenv("HOME_BASE_PERMISSION_LAYER_HOST")
++    url = "http://other-model.test/v1/chat/completions"
++    assert call(mode, "alex", url) == "fresh reply 1"
++    assert call(mode, "alex", url) == "fresh reply 1"
++    assert len(calls) == 1
++    assert "X-Home-Base-User" not in calls[0]
++
++
++@pytest.mark.parametrize("mode", ["sync", "async"])
++@pytest.mark.parametrize("url", [
++    "http://permission-layer.:8000/v1/chat/completions",
++    "http://127.0.0.1:8000/v1/chat/completions",
++    "http://broker-alias.test:8000/v1/chat/completions",
++])
++def test_aliases_and_addresses_cannot_reenable_response_cache(endpoint, mode, url):
++    calls, _ = endpoint
++    assert call(mode, "alex", url) == "fresh reply 1"
++    assert call(mode, "sam", url) == "fresh reply 2"
++    assert len(calls) == 2
++    assert llm._response_cache == {} and llm._response_model_cache == {}
++
++
++@pytest.mark.parametrize("mode", ["sync", "async"])
++def test_old_cached_response_cannot_skip_permission_layer(endpoint, monkeypatch, mode):
++    calls, _ = endpoint
++    monkeypatch.delenv("HOME_BASE_PERMISSION_LAYER_HOST")
++    assert call(mode, "alex") == "fresh reply 1"
++    monkeypatch.setenv("HOME_BASE_PERMISSION_LAYER_HOST", "permission-layer")
++    assert call(mode, "sam") == "fresh reply 2"
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize("target", ["", "http://permission-layer", "permission-layer/path", "[invalid"])
++def test_invalid_permission_host_disables_both_cache_reads_and_writes(endpoint, monkeypatch, target):
++    calls, _ = endpoint
++    monkeypatch.setenv("HOME_BASE_PERMISSION_LAYER_HOST", target)
++    assert call("sync", "alex") == "fresh reply 1"
++    assert call("sync", "alex") == "fresh reply 2"
++    assert len(calls) == 2 and llm._response_cache == {}
++
++
++def test_malformed_url_does_not_produce_a_usable_cache_key(endpoint):
++    llm._response_cache[None] = "must not return"
++    llm._response_model_cache[None] = "must not return"
++    key = llm._get_cache_key("http://[invalid", "home-base", MESSAGES, 1.0, 0)
++    assert key is None
++    assert llm._get_cached_response(key) is None
++    assert llm._get_cached_response_model(key) is None
++    llm._set_cached_response(key, "must not store", actual_model="must not store")
++    assert llm._response_cache[None] == "must not return"
++    assert llm._response_model_cache[None] == "must not return"

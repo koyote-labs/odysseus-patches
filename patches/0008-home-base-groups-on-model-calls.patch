@@ -1,0 +1,129 @@
+# Carry the signed-in person's Authentik groups onto model calls
+#
+# Adds: model calls to the Home Base permission layer carry
+# X-Home-Base-Groups alongside X-Home-Base-User, so the permission layer can
+# take a person's role from group membership rather than from a file.
+# Why: roles lived in two hand-edited files, so adding a family member meant
+# editing both. Authentik already knows who is an adult and who is a kid, and
+# the edge already sends the groups to Odysseus; this carries them the last
+# hop. The groups travel only where the identity already travels: to
+# HOME_BASE_PERMISSION_LAYER_HOST, with the caller secret. No other endpoint
+# is ever told who is asking or what they belong to.
+# Upstream: a Home Base feature, not a bug fix. Needs 0005 and 0006.
+# Test: tests/test_home_base_groups.py
+
+--- a/app.py
++++ b/app.py
+@@ -416,10 +416,12 @@
+                 request.state.current_user = _hb_user
+                 request.state.api_token = False
+                 _hb_token = _hb.set_user(_hb_user)
++                _hb_groups_token = _hb.set_groups(_hb.edge_groups(request.headers))
+                 try:
+                     return await call_next(request)
+                 finally:
+                     _hb.reset_user(_hb_token)
++                    _hb.reset_groups(_hb_groups_token)
+             if LOCALHOST_BYPASS and _is_trusted_loopback(request):
+                 return await call_next(request)
+             if not auth_manager.is_configured:
+--- a/src/home_base_identity.py
++++ b/src/home_base_identity.py
+@@ -33,6 +33,7 @@
+ CALLER_SECRET_HEADER = "X-Home-Base-Caller-Secret"
+ 
+ _current_user: ContextVar[Optional[str]] = ContextVar("home_base_user", default=None)
++_current_groups: ContextVar[frozenset] = ContextVar("home_base_groups", default=frozenset())
+ 
+ 
+ def edge_user(headers) -> Optional[str]:
+@@ -88,6 +89,19 @@
+     _current_user.reset(token)
+ 
+ 
++def set_groups(groups) -> Token:
++    """Keep the signed-in person's groups for the rest of this request."""
++    return _current_groups.set(frozenset(groups or ()))
++
++
++def reset_groups(token: Token) -> None:
++    _current_groups.reset(token)
++
++
++def current_groups() -> frozenset:
++    return _current_groups.get()
++
++
+ def current_user() -> Optional[str]:
+     return _current_user.get()
+ 
+@@ -108,4 +122,7 @@
+     out = dict(headers or {})
+     out[USER_HEADER] = user
+     out[CALLER_SECRET_HEADER] = secret
++    groups = _current_groups.get()
++    if groups:
++        out[GROUPS_HEADER] = "|".join(sorted(groups))
+     return out
+diff --git a/tests/test_home_base_groups.py b/tests/test_home_base_groups.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_home_base_groups.py
+@@ -0,0 +1,57 @@
++"""The signed-in person's groups travel with the identity, and only there."""
++
++import os
++
++import pytest
++
++from src import home_base_identity as hb
++
++PERMISSION_URL = "http://permission-layer:8000/v1/chat/completions"
++
++
++@pytest.fixture(autouse=True)
++def configured(monkeypatch):
++    monkeypatch.setenv("HOME_BASE_PERMISSION_LAYER_HOST", "permission-layer")
++    monkeypatch.setenv("HOME_BASE_CALLER_SECRET", "synthetic-caller-secret")
++
++
++def test_groups_are_sent_to_the_permission_layer():
++    user = hb.set_user("alex")
++    groups = hb.set_groups({"home-base-adults", "home-base-admins"})
++    try:
++        out = hb.with_identity(PERMISSION_URL, {})
++    finally:
++        hb.reset_user(user)
++        hb.reset_groups(groups)
++    assert out["X-Home-Base-Groups"] == "home-base-admins|home-base-adults"
++    assert out["X-Home-Base-User"] == "alex"
++
++
++def test_no_groups_header_when_the_person_has_none():
++    user = hb.set_user("alex")
++    try:
++        assert "X-Home-Base-Groups" not in hb.with_identity(PERMISSION_URL, {})
++    finally:
++        hb.reset_user(user)
++
++
++def test_groups_never_go_anywhere_else():
++    user = hb.set_user("alex")
++    groups = hb.set_groups({"home-base-adults"})
++    try:
++        out = hb.with_identity("https://api.openai.com/v1/chat/completions", {"A": "1"})
++    finally:
++        hb.reset_user(user)
++        hb.reset_groups(groups)
++    assert out == {"A": "1"}
++
++
++def test_groups_do_not_leak_between_requests():
++    token = hb.set_groups({"home-base-kids"})
++    hb.reset_groups(token)
++    assert hb.current_groups() == frozenset()
++
++
++def test_edge_groups_parses_the_pipe_list():
++    assert hb.edge_groups({"X-Home-Base-Groups": "a | b|| c "}) == {"a", "b", "c"}
++    assert hb.edge_groups({}) == set()

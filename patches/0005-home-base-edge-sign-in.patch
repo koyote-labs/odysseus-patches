@@ -1,0 +1,299 @@
+# Home Base edge sign-in
+#
+# Adds: trust the person the Home Base edge proxy signed in, via Authentik.
+# Why: Home Base signs people in once, at the edge. The edge forwards each
+# request with X-Home-Base-User, X-Home-Base-Groups, and a shared secret,
+# X-Home-Base-Edge-Secret. When ODYSSEUS_EDGE_SECRET is set and the secret
+# matches, compared in constant time, Odysseus treats that user as signed in
+# and keeps the user for the rest of the request in src/home_base_identity.py.
+# /api/auth/status reports the same user, since the front end asks it
+# whether someone is signed in.
+#
+# Edge sign-in creates the account on first sight and marks it, and only ever
+# maps onto accounts it created: an Authentik account named like a local
+# Odysseus account, such as the bootstrap admin, is refused. Admin rights
+# follow membership in the Authentik group HOME_BASE_ADMIN_GROUP (default
+# home-base-admins) on every sign-in. Without the secret nothing changes, so
+# other containers on the rack network cannot claim to be anyone.
+# Upstream: a Home Base feature, not a bug fix. Not for upstream as is.
+# Test: tests/test_home_base_identity.py
+
+diff --git a/app.py b/app.py
+index 80eb83c8..ad31d047 100644
+--- a/app.py
++++ b/app.py
+@@ -402,6 +402,24 @@ if AUTH_ENABLED:
+             # _is_trusted_loopback so LOCALHOST_BYPASS can't be abused over a
+             # Cloudflare tunnel / reverse proxy. Keep LOCALHOST_BYPASS=false for
+             # network-exposed deployments regardless.
++            # Home Base edge sign-in: the edge proxy has signed the person in
++            # and proves it with a shared secret. Provision the account on
++            # first sight, and keep the user for model calls on this request.
++            try:
++                from src import home_base_identity as _hb
++                _auth_mgr = getattr(request.app.state, "auth_manager", None) or auth_manager
++                _hb_user = _hb.sign_in_from_edge(_auth_mgr, request.headers)
++            except Exception as _e:
++                logger.warning("Home Base edge sign-in check failed", exc_info=_e)
++                _hb_user = None
++            if _hb_user:
++                request.state.current_user = _hb_user
++                request.state.api_token = False
++                _hb_token = _hb.set_user(_hb_user)
++                try:
++                    return await call_next(request)
++                finally:
++                    _hb.reset_user(_hb_token)
+             if LOCALHOST_BYPASS and _is_trusted_loopback(request):
+                 return await call_next(request)
+             if not auth_manager.is_configured:
+diff --git a/routes/auth_routes.py b/routes/auth_routes.py
+index a35d466c..0957b4dc 100644
+--- a/routes/auth_routes.py
++++ b/routes/auth_routes.py
+@@ -206,6 +206,22 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
+     async def auth_status(request: Request):
+         token = request.cookies.get(SESSION_COOKIE)
+         result = auth_manager.status(token)
++        # Home Base edge sign-in: a person signed in at the edge has no
++        # Odysseus cookie, so report the edge user, with the same secret check
++        # and first-sight account creation as the auth middleware.
++        if not result.get("authenticated"):
++            try:
++                from src import home_base_identity as _hb
++                _hb_user = _hb.sign_in_from_edge(auth_manager, request.headers)
++                if _hb_user:
++                    result.update({
++                        "authenticated": True,
++                        "username": _hb_user,
++                        "is_admin": auth_manager.is_admin(_hb_user),
++                        "privileges": auth_manager.get_privileges(_hb_user),
++                    })
++            except Exception:
++                logger.warning("Home Base edge sign-in status check failed", exc_info=True)
+         result["signup_enabled"] = auth_manager.signup_enabled
+         # Include the caller's effective privileges so the frontend can
+         # hide / dim UI controls the user isn't allowed to use. Admins get
+diff --git a/src/home_base_identity.py b/src/home_base_identity.py
+new file mode 100644
+index 00000000..3d009b85
+--- /dev/null
++++ b/src/home_base_identity.py
+@@ -0,0 +1,111 @@
++"""Home Base sign-in at the edge, and the signed-in person on model calls.
++
++The Home Base edge proxy signs people in with Authentik, then forwards each
++request with X-Home-Base-User and a shared secret, X-Home-Base-Edge-Secret.
++Odysseus trusts that user only when the secret matches ODYSSEUS_EDGE_SECRET.
++
++For the rest of that request, the user is kept in a context variable. Model
++calls to the Home Base permission layer, and only to it, then carry the user
++and HOME_BASE_CALLER_SECRET, so the permission layer can apply that person's
++rules. Anyone else is never told who is asking.
++
++Admin rights come from membership in an Authentik group, HOME_BASE_ADMIN_GROUP
++(default home-base-admins), passed by the edge in X-Home-Base-Groups. An edge
++sign-in only ever maps onto an account that edge sign-in created, so an
++Authentik account named like a local Odysseus account never becomes it.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import secrets
++from contextvars import ContextVar, Token
++from typing import Dict, Optional
++from urllib.parse import urlparse
++
++logger = logging.getLogger(__name__)
++
++USER_HEADER = "X-Home-Base-User"
++GROUPS_HEADER = "X-Home-Base-Groups"
++EDGE_MARK = "home_base_edge"
++EDGE_SECRET_HEADER = "X-Home-Base-Edge-Secret"
++CALLER_SECRET_HEADER = "X-Home-Base-Caller-Secret"
++
++_current_user: ContextVar[Optional[str]] = ContextVar("home_base_user", default=None)
++
++
++def edge_user(headers) -> Optional[str]:
++    """The signed-in user, if the request came through the edge with its secret."""
++    expected = os.getenv("ODYSSEUS_EDGE_SECRET", "")
++    presented = headers.get(EDGE_SECRET_HEADER) or ""
++    user = (headers.get(USER_HEADER) or "").strip().lower()
++    if not expected or not presented or not user:
++        return None
++    if not secrets.compare_digest(presented.encode(), expected.encode()):
++        return None
++    return user
++
++
++def edge_groups(headers) -> set:
++    """Authentik group names, sent by the edge as a pipe-separated list."""
++    return {g.strip() for g in (headers.get(GROUPS_HEADER) or "").split("|") if g.strip()}
++
++
++def sign_in_from_edge(auth_mgr, headers) -> Optional[str]:
++    """Resolve an edge sign-in to an Odysseus account, or None.
++
++    Creates the account on first sign-in and marks it as created by the
++    edge. Refuses to map onto an account the edge did not create. Keeps the
++    admin flag in step with membership in the admin group.
++    """
++    user = edge_user(headers)
++    if not user:
++        return None
++    want_admin = os.getenv("HOME_BASE_ADMIN_GROUP", "home-base-admins") in edge_groups(headers)
++    if user not in auth_mgr.users:
++        if not auth_mgr.create_user(user, secrets.token_urlsafe(32)):
++            return None
++        with auth_mgr._config_lock:
++            auth_mgr._config["users"][user][EDGE_MARK] = True
++            auth_mgr._save()
++    record = auth_mgr.users.get(user) or {}
++    if not record.get(EDGE_MARK):
++        logger.warning("Refusing edge sign-in for %r: a local Odysseus account has that name", user)
++        return None
++    if bool(record.get("is_admin")) != want_admin:
++        granter = next((u for u, d in auth_mgr.users.items() if d.get("is_admin") and u != user), None)
++        if granter:
++            auth_mgr.set_admin(user, want_admin, requesting_user=granter)
++    return user
++
++
++def set_user(user: Optional[str]) -> Token:
++    return _current_user.set(user)
++
++
++def reset_user(token: Token) -> None:
++    _current_user.reset(token)
++
++
++def current_user() -> Optional[str]:
++    return _current_user.get()
++
++
++def with_identity(url: str, headers: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
++    """Add the signed-in user to a model call, only if it goes to the permission layer."""
++    user = _current_user.get()
++    target = os.getenv("HOME_BASE_PERMISSION_LAYER_HOST", "")
++    secret = os.getenv("HOME_BASE_CALLER_SECRET", "")
++    if not (user and target and secret):
++        return headers
++    try:
++        host = urlparse(url).hostname
++    except ValueError:
++        return headers
++    if host != target:
++        return headers
++    out = dict(headers or {})
++    out[USER_HEADER] = user
++    out[CALLER_SECRET_HEADER] = secret
++    return out
+diff --git a/tests/test_home_base_identity.py b/tests/test_home_base_identity.py
+new file mode 100644
+index 00000000..3a3c9560
+--- /dev/null
++++ b/tests/test_home_base_identity.py
+@@ -0,0 +1,100 @@
++"""Home Base edge sign-in and identity on model calls (src/home_base_identity.py)."""
++
++import pytest
++
++from src import home_base_identity as hb
++
++
++@pytest.fixture
++def env(monkeypatch):
++    monkeypatch.setenv("ODYSSEUS_EDGE_SECRET", "edge-secret")
++    monkeypatch.setenv("HOME_BASE_PERMISSION_LAYER_HOST", "permission-layer")
++    monkeypatch.setenv("HOME_BASE_CALLER_SECRET", "caller-secret")
++
++
++def test_edge_user_needs_the_matching_secret(env):
++    assert hb.edge_user({"X-Home-Base-User": "Alex", "X-Home-Base-Edge-Secret": "edge-secret"}) == "alex"
++    assert hb.edge_user({"X-Home-Base-User": "alex", "X-Home-Base-Edge-Secret": "wrong"}) is None
++    assert hb.edge_user({"X-Home-Base-User": "alex", "X-Home-Base-Edge-Secret": ""}) is None
++    assert hb.edge_user({"X-Home-Base-User": "alex"}) is None
++    assert hb.edge_user({"X-Home-Base-Edge-Secret": "edge-secret"}) is None
++
++
++def test_edge_sign_in_is_off_without_a_configured_secret(monkeypatch):
++    monkeypatch.delenv("ODYSSEUS_EDGE_SECRET", raising=False)
++    assert hb.edge_user({"X-Home-Base-User": "alex", "X-Home-Base-Edge-Secret": ""}) is None
++
++
++def test_identity_goes_only_to_the_permission_layer(env):
++    token = hb.set_user("alex")
++    try:
++        added = hb.with_identity("http://permission-layer:8000/v1/chat/completions", {"A": "1"})
++        assert added == {"A": "1", "X-Home-Base-User": "alex", "X-Home-Base-Caller-Secret": "caller-secret"}
++        assert hb.with_identity("https://api.openai.com/v1/chat/completions", {"A": "1"}) == {"A": "1"}
++        assert hb.with_identity("http://permission-layer.evil.test/v1", None) is None
++    finally:
++        hb.reset_user(token)
++
++
++def test_no_signed_in_user_adds_nothing(env):
++    assert hb.current_user() is None
++    assert hb.with_identity("http://permission-layer:8000/v1/chat/completions", {"A": "1"}) == {"A": "1"}
++
++
++def test_no_caller_secret_adds_nothing(env, monkeypatch):
++    monkeypatch.delenv("HOME_BASE_CALLER_SECRET")
++    token = hb.set_user("alex")
++    try:
++        assert hb.with_identity("http://permission-layer:8000/v1", {}) == {}
++    finally:
++        hb.reset_user(token)
++
++
++# Edge sign-in against a real AuthManager.
++
++from core.auth import AuthManager
++
++
++@pytest.fixture
++def mgr(tmp_path, env):
++    m = AuthManager(str(tmp_path / "auth.json"))
++    m.create_user("admin", "local-admin-password", is_admin=True)  # the bootstrap admin
++    return m
++
++
++def edge(user, groups=""):
++    return {"X-Home-Base-User": user, "X-Home-Base-Edge-Secret": "edge-secret", "X-Home-Base-Groups": groups}
++
++
++def test_first_sign_in_creates_a_marked_non_admin_account(mgr):
++    assert hb.sign_in_from_edge(mgr, edge("alex")) == "alex"
++    assert mgr.users["alex"][hb.EDGE_MARK] is True
++    assert not mgr.is_admin("alex")
++
++
++def test_admin_follows_the_admin_group(mgr):
++    assert hb.sign_in_from_edge(mgr, edge("jordan", "family|home-base-admins")) == "jordan"
++    assert mgr.is_admin("jordan")
++    assert hb.sign_in_from_edge(mgr, edge("jordan", "family")) == "jordan"
++    assert not mgr.is_admin("jordan")
++
++
++def test_edge_account_named_like_a_local_account_is_refused(mgr):
++    assert hb.sign_in_from_edge(mgr, edge("admin")) is None
++    assert hb.sign_in_from_edge(mgr, edge("admin", "home-base-admins")) is None
++    assert mgr.is_admin("admin")
++    assert hb.EDGE_MARK not in mgr.users["admin"]
++
++
++def test_wrong_edge_secret_signs_no_one_in(mgr):
++    headers = edge("alex") | {"X-Home-Base-Edge-Secret": "wrong"}
++    assert hb.sign_in_from_edge(mgr, headers) is None
++    assert "alex" not in mgr.users
++
++
++def test_admin_group_name_is_configurable(mgr, monkeypatch):
++    monkeypatch.setenv("HOME_BASE_ADMIN_GROUP", "parents")
++    hb.sign_in_from_edge(mgr, edge("jordan", "home-base-admins"))
++    assert not mgr.is_admin("jordan")
++    hb.sign_in_from_edge(mgr, edge("jordan", "parents"))
++    assert mgr.is_admin("jordan")
